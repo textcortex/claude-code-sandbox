@@ -589,40 +589,62 @@ exec claude --dangerously-skip-permissions' > /start-claude.sh && \\
 
       // Also copy .git directory to preserve git history
       console.log(chalk.blue("• Copying git history..."));
-      const gitTarFile = `/tmp/claude-sandbox-git-${Date.now()}.tar`;
-      // Exclude macOS resource fork files and .DS_Store when creating git archive
-      // Also strip extended attributes to prevent macOS xattr issues in Docker
-      const tarFlags = getTarFlags();
-      // On macOS, also exclude extended attributes that cause Docker issues
-      const additionalFlags = (process.platform as string) === "darwin" ? "--no-xattrs --no-fflags" : "";
-      const combinedFlags = `${tarFlags} ${additionalFlags}`.trim();
-      execSync(
-        `tar -cf "${gitTarFile}" --exclude="._*" --exclude=".DS_Store" ${combinedFlags} .git`,
-        {
-          cwd: workDir,
-          stdio: "pipe",
-        },
-      );
-
-      try {
-        const gitStream = fs.createReadStream(gitTarFile);
-
-        // Upload git archive
-        await container.putArchive(gitStream, {
-          path: "/workspace",
-        });
-
-        // Clean up
-        fs.unlinkSync(gitTarFile);
-      } catch (error) {
-        console.error(chalk.red("✗ Git history copy failed:"), error);
-        // Clean up the tar file even if upload failed
+      
+      // Skip .git copy on macOS for now due to extended attribute issues
+      if (process.platform === "darwin") {
+        console.log(chalk.yellow("⚠ Skipping .git directory copy on macOS due to Docker extended attribute issues"));
+        console.log(chalk.yellow("  Git history will be initialized fresh in the container"));
+        
+        // Initialize git in container instead
         try {
-          fs.unlinkSync(gitTarFile);
-        } catch (e) {
-          // Ignore cleanup errors
+          const initGitExec = await container.exec({
+            Cmd: [
+              "/bin/bash",
+              "-c",
+              `cd /workspace && git init && git add . && git commit -m "Initial commit from claude-sandbox"`,
+            ],
+            AttachStdout: false,
+            AttachStderr: false,
+            User: "claude",
+          });
+          await initGitExec.start({});
+        } catch (error) {
+          console.error(chalk.yellow("⚠ Failed to initialize git in container:"), error);
         }
-        throw error;
+      } else {
+        const gitTarFile = `/tmp/claude-sandbox-git-${Date.now()}.tar`;
+        // Exclude macOS resource fork files and .DS_Store when creating git archive
+        // Also strip extended attributes to prevent macOS xattr issues in Docker
+        const tarFlags = getTarFlags();
+        const additionalFlags = "--exclude=._* --exclude=.DS_Store";
+        execSync(
+          `tar -cf "${gitTarFile}" ${tarFlags} ${additionalFlags} .git`,
+          {
+            cwd: workDir,
+            stdio: "pipe",
+          },
+        );
+
+        try {
+          const gitStream = fs.createReadStream(gitTarFile);
+
+          // Upload git archive
+          await container.putArchive(gitStream, {
+            path: "/workspace",
+          });
+
+          // Clean up
+          fs.unlinkSync(gitTarFile);
+        } catch (error) {
+          console.error(chalk.red("✗ Git history copy failed:"), error);
+          // Clean up the tar file even if upload failed
+          try {
+            fs.unlinkSync(gitTarFile);
+          } catch (e) {
+            // Ignore cleanup errors
+          }
+          throw error;
+        }
       }
     } catch (error) {
       console.error(chalk.red("✗ Failed to copy files:"), error);
