@@ -593,8 +593,11 @@ exec claude --dangerously-skip-permissions' > /start-claude.sh && \\
       // Exclude macOS resource fork files and .DS_Store when creating git archive
       // Also strip extended attributes to prevent macOS xattr issues in Docker
       const tarFlags = getTarFlags();
+      // On macOS, also exclude extended attributes that cause Docker issues
+      const additionalFlags = (process.platform as string) === "darwin" ? "--no-xattrs --no-fflags" : "";
+      const combinedFlags = `${tarFlags} ${additionalFlags}`.trim();
       execSync(
-        `tar -cf "${gitTarFile}" --exclude="._*" --exclude=".DS_Store" ${tarFlags} .git`,
+        `tar -cf "${gitTarFile}" --exclude="._*" --exclude=".DS_Store" ${combinedFlags} .git`,
         {
           cwd: workDir,
           stdio: "pipe",
@@ -785,8 +788,11 @@ exec claude --dangerously-skip-permissions' > /start-claude.sh && \\
 
         const tarFile = `/tmp/claude-dir-${Date.now()}.tar`;
         const tarFlags = getTarFlags();
+        // On macOS, also exclude extended attributes that cause Docker issues
+        const additionalFlags = (process.platform as string) === "darwin" ? "--no-xattrs --no-fflags" : "";
+        const combinedFlags = `${tarFlags} ${additionalFlags}`.trim();
         execSync(
-          `tar -cf "${tarFile}" ${tarFlags} -C "${os.homedir()}" .claude`,
+          `tar -cf "${tarFile}" ${combinedFlags} -C "${os.homedir()}" .claude`,
           {
             stdio: "pipe",
           },
