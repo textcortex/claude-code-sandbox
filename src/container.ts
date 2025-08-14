@@ -66,22 +66,24 @@ export class ContainerManager {
   private async ensureImage(): Promise<void> {
     const imageName = this.config.dockerImage || "claude-code-sandbox:latest";
 
-    // Check if image already exists
+    // If a custom dockerfile is specified, always rebuild to ensure changes are applied
+    if (this.config.dockerfile) {
+      console.log(chalk.blue(`• Building image from custom Dockerfile: ${imageName}...`));
+      await this.buildImage(this.config.dockerfile, imageName);
+      return;
+    }
+
+    // For default builds, check if image already exists
     try {
       await this.docker.getImage(imageName).inspect();
       console.log(chalk.green(`✓ Using existing image: ${imageName}`));
       return;
     } catch (error) {
-      console.log(chalk.blue(`• Building image: ${imageName}...`));
+      console.log(chalk.blue(`• Building default image: ${imageName}...`));
     }
 
-    // Check if we need to build from Dockerfile
-    if (this.config.dockerfile) {
-      await this.buildImage(this.config.dockerfile, imageName);
-    } else {
-      // Use default Dockerfile
-      await this.buildDefaultImage(imageName);
-    }
+    // Use default Dockerfile
+    await this.buildDefaultImage(imageName);
   }
 
   private async buildDefaultImage(imageName: string): Promise<void> {
