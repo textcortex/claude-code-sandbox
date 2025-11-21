@@ -1,0 +1,28 @@
+{
+  "dockerImage": "claude-code-sandbox:latest",
+  "dockerfile": null,
+  "detached": false,
+  "autoPush": false,
+  "autoCreatePR": false,
+  "autoStartClaude": true,
+  "envFile": ".env",
+  "environment": {
+    "NODE_ENV": "development",
+    "PRIVATE_DEPLOYMENT": "true"
+  },
+  "setupCommands": ["npm install", "npm run build"],
+  "volumes": [],
+  "mounts": [
+    {
+      "source": "./data",
+      "target": "/workspace/data",
+      "readonly": false
+    }
+  ],
+  "allowedTools": ["*"],
+  "maxThinkingTokens": 200000,
+  "bashTimeout": 600000,
+  "containerPrefix": "claude-sandbox-private",
+  "claudeConfigPath": "~/.claude.json",
+  "dockerSocketPath": null
+}
