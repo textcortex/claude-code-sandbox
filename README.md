@@ -2,9 +2,7 @@
 
 > [!WARNING]
 >
-> - This work is alpha and might have security issues, use at your own risk.
-> - Check [TODO.md](./TODO.md) for the roadmap.
-> - Email [dev@textcortex.com](mailto:dev@textcortex.com) for inquiries.
+> This was an early PoC and is now archived. Follow [Spritz](https://github.com/textcortex/spritz) for the continuation of this vision
 
 Run Claude Code as an autonomous agent inside Docker containers with automatic GitHub integration. Bypass all permissions safely.
 
