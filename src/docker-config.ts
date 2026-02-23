@@ -1,12 +1,13 @@
 import * as fs from "fs";
 import * as path from "path";
+import * as os from "os";
 
 interface DockerConfig {
   socketPath?: string;
 }
 
 /**
- * Detects whether Docker or Podman is available and returns appropriate configuration
+ * Detects whether Docker, Colima, or Podman is available and returns appropriate configuration
  * @param customSocketPath - Optional custom socket path from configuration
  */
 export function getDockerConfig(customSocketPath?: string): DockerConfig {
@@ -24,6 +25,10 @@ export function getDockerConfig(customSocketPath?: string): DockerConfig {
   const socketPaths = [
     // Docker socket paths
     "/var/run/docker.sock",
+
+    // Colima socket paths
+    path.join(os.homedir(), ".colima", "default", "docker.sock"),
+    path.join(os.homedir(), ".docker", "run", "docker.sock"),
 
     // Podman rootless socket paths
     process.env.XDG_RUNTIME_DIR &&
