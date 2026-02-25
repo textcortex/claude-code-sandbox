@@ -8,6 +8,7 @@ import chalk from "chalk";
 import { exec } from "child_process";
 import { promisify } from "util";
 import { ShadowRepository } from "./git/shadow-repository";
+import { SHADOW_BASE_PATH } from "./config";
 
 const execAsync = promisify(exec);
 
@@ -31,6 +32,10 @@ export class WebUIServer {
   private originalRepo: string = "";
   private currentBranch: string = "main";
   private fileWatchers: Map<string, any> = new Map(); // container -> monitor (inotify stream or interval)
+  private shadowBasePath: string = SHADOW_BASE_PATH;
+  private autoCommitTimers: Map<string, NodeJS.Timeout> = new Map();
+  private autoCommitEnabled: boolean = true;
+  private autoCommitIntervalMs: number = 5 * 60 * 1000; // 5 minutes default
 
   constructor(docker: Docker) {
     this.docker = docker;
@@ -257,12 +262,13 @@ export class WebUIServer {
                   connectedSocket.emit("container-disconnected");
                 }
               }
-              // Stop continuous monitoring
+              // Stop continuous monitoring and auto-commit
               this.stopContinuousMonitoring(containerId);
-              // Clean up session and shadow repo
+              this.stopAutoCommit(containerId);
+              // Clean up session but preserve shadow repo for recovery
               this.sessions.delete(containerId);
               if (this.shadowRepos.has(containerId)) {
-                this.shadowRepos.get(containerId)?.cleanup();
+                this.shadowRepos.get(containerId)?.cleanup(true);
                 this.shadowRepos.delete(containerId);
               }
             });
@@ -271,6 +277,9 @@ export class WebUIServer {
 
             // Start continuous monitoring for this container
             this.startContinuousMonitoring(containerId);
+
+            // Start auto-commit for this container
+            this.startAutoCommit(containerId);
           } else {
             // Add this socket to the existing session
             console.log(chalk.blue("Reconnecting to existing Claude session"));
@@ -463,16 +472,20 @@ export class WebUIServer {
       // Initialize shadow repo if not exists
       let isNewShadowRepo = false;
       if (!this.shadowRepos.has(containerId)) {
-        const shadowRepo = new ShadowRepository({
-          originalRepo: this.originalRepo || process.cwd(),
-          claudeBranch: this.currentBranch || "claude-changes",
-          sessionId: containerId.substring(0, 12),
-        });
-        this.shadowRepos.set(containerId, shadowRepo);
+        const shadowRepo = new ShadowRepository(
+          {
+            originalRepo: this.originalRepo || process.cwd(),
+            claudeBranch: this.currentBranch || "claude-changes",
+            sessionId: containerId.substring(0, 12),
+          },
+          this.shadowBasePath,
+        );
         isNewShadowRepo = true;
 
         // Reset shadow repo to match container's branch (important for PR/remote branch scenarios)
+        // Only add to map after successful initialization to allow retry on failure
         await shadowRepo.resetToContainerBranch(containerId);
+        this.shadowRepos.set(containerId, shadowRepo);
       }
 
       // Sync files from container (inotify already told us there are changes)
@@ -808,10 +821,110 @@ export class WebUIServer {
     this.currentBranch = branch;
   }
 
-  async stop(): Promise<void> {
-    // Clean up shadow repos
+  setShadowBasePath(basePath: string): void {
+    this.shadowBasePath = basePath;
+  }
+
+  setAutoCommitConfig(enabled: boolean, intervalMinutes: number): void {
+    this.autoCommitEnabled = enabled;
+    this.autoCommitIntervalMs = intervalMinutes * 60 * 1000;
+  }
+
+  private startAutoCommit(containerId: string): void {
+    if (!this.autoCommitEnabled) return;
+
+    // Clear existing timer if any
+    this.stopAutoCommit(containerId);
+
+    console.log(
+      chalk.blue(
+        `[AUTO-COMMIT] Starting auto-commit every ${this.autoCommitIntervalMs / 60000} minutes for ${containerId.substring(0, 12)}`,
+      ),
+    );
+
+    const timer = setInterval(async () => {
+      await this.performAutoCommit(containerId);
+    }, this.autoCommitIntervalMs);
+
+    this.autoCommitTimers.set(containerId, timer);
+  }
+
+  private stopAutoCommit(containerId: string): void {
+    const timer = this.autoCommitTimers.get(containerId);
+    if (timer) {
+      clearInterval(timer);
+      this.autoCommitTimers.delete(containerId);
+      console.log(
+        chalk.gray(
+          `[AUTO-COMMIT] Stopped for ${containerId.substring(0, 12)}`,
+        ),
+      );
+    }
+  }
+
+  private async performAutoCommit(containerId: string): Promise<void> {
+    try {
+      const container = this.docker.getContainer(containerId);
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+
+      // git add -u stages only tracked files; git diff --cached --quiet exits 1 when staged changes exist
+      const commitExec = await container.exec({
+        Cmd: [
+          "/bin/bash",
+          "-c",
+          `cd /workspace && git add -u && git diff --cached --quiet || git commit -m "[auto-save] ${timestamp}"`,
+        ],
+        AttachStdout: true,
+        AttachStderr: true,
+        WorkingDir: "/workspace",
+        User: "claude",
+      });
+
+      const stream = await commitExec.start({});
+
+      // Consume stream and check output
+      let output = "";
+      await new Promise<void>((resolve) => {
+        stream.on("data", (chunk: Buffer) => {
+          output += chunk.toString();
+        });
+        stream.on("end", resolve);
+        stream.on("error", () => resolve());
+      });
+
+      if (output.includes("[auto-save]")) {
+        console.log(
+          chalk.cyan(
+            `[AUTO-COMMIT] Committed changes in ${containerId.substring(0, 12)}`,
+          ),
+        );
+
+        // Trigger a sync so shadow repo picks up the commit
+        await this.performSync(containerId);
+      } else {
+        console.log(
+          chalk.gray(
+            `[AUTO-COMMIT] No changes to commit in ${containerId.substring(0, 12)}`,
+          ),
+        );
+      }
+    } catch (error) {
+      console.error(
+        chalk.yellow(`[AUTO-COMMIT] Failed for ${containerId.substring(0, 12)}:`),
+        error,
+      );
+    }
+  }
+
+  async stop(intentional: boolean = true): Promise<void> {
+    // Clean up auto-commit timers
+    for (const [containerId] of this.autoCommitTimers) {
+      this.stopAutoCommit(containerId);
+    }
+
+    // Clean up shadow repos (preserve on non-intentional stop)
     for (const [, shadowRepo] of this.shadowRepos) {
-      await shadowRepo.cleanup();
+      await shadowRepo.cleanup(!intentional);
     }
 
     // Clean up all sessions

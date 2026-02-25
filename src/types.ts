@@ -26,6 +26,11 @@ export interface SandboxConfig {
   remoteBranch?: string;
   prNumber?: string;
   dockerSocketPath?: string;
+  useWebUI?: boolean;
+  restartPolicy?: "no" | "always" | "unless-stopped" | "on-failure";
+  autoCommit?: boolean;
+  autoCommitIntervalMinutes?: number;
+  shadowBasePath?: string;
 }
 
 export interface Credentials {

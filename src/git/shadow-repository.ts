@@ -2,6 +2,7 @@ import * as path from 'path';
 import * as fs from 'fs-extra';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import os from 'os';
 import chalk from 'chalk';
 
 const execAsync = promisify(exec);
@@ -19,7 +20,7 @@ export class ShadowRepository {
 
   constructor(
     private options: ShadowRepoOptions,
-    private basePath: string = '/tmp/claude-shadows'
+    private basePath: string = path.join(os.homedir(), '.cache', 'claude-sandbox', 'shadows')
   ) {
     this.shadowPath = path.join(this.basePath, this.options.sessionId);
     this.rsyncExcludeFile = path.join(
@@ -741,7 +742,20 @@ export class ShadowRepository {
     console.log(stdout);
   }
 
-  async cleanup(): Promise<void> {
+  async cleanup(preserve: boolean = false): Promise<void> {
+    if (preserve) {
+      console.log(chalk.gray('💾 Shadow repository preserved at: ' + this.shadowPath));
+      // Still clean up the exclude file
+      if (await fs.pathExists(this.rsyncExcludeFile)) {
+        try {
+          await fs.remove(this.rsyncExcludeFile);
+        } catch (error) {
+          // Ignore exclude file cleanup errors
+        }
+      }
+      return;
+    }
+
     if (await fs.pathExists(this.shadowPath)) {
       try {
         // Try to force remove with rm -rf first

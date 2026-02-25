@@ -162,6 +162,31 @@ claude-sandbox config
 
 ### Configuration
 
+Configuration is loaded from multiple sources (later overrides earlier):
+
+1. **Built-in defaults**
+2. **Global config**: `~/.config/claude-sandbox/config.json`
+3. **Project config**: `./claude-sandbox.config.json`
+
+#### Global Configuration
+
+Set defaults for all projects by creating a global config file:
+
+```bash
+mkdir -p ~/.config/claude-sandbox
+cat > ~/.config/claude-sandbox/config.json << 'EOF'
+{
+  "dockerImage": "my-custom-image:latest",
+  "autoPush": false,
+  "defaultShell": "bash"
+}
+EOF
+```
+
+Project-specific configs can still override these settings.
+
+#### Project Configuration
+
 Create a `claude-sandbox.config.json` file (see `claude-sandbox.config.example.json` for reference):
 
 ```json
@@ -235,15 +260,19 @@ Example use cases:
 
 ## Features
 
-### Podman Support
+### Docker, Colima & Podman Support
 
-Claude Code Sandbox now supports Podman as an alternative to Docker. The tool automatically detects whether you're using Docker or Podman by checking for available socket paths:
+Claude Code Sandbox automatically detects your container runtime by checking for available socket paths:
 
-- **Automatic detection**: The tool checks for Docker and Podman sockets in standard locations
-- **Custom socket paths**: Use the `dockerSocketPath` configuration option to specify a custom socket
-- **Environment variable**: Set `DOCKER_HOST` to override socket detection
+**Detected socket paths (in order):**
 
-Example configuration for Podman:
+- `/var/run/docker.sock` (Docker standard)
+- `$XDG_RUNTIME_DIR/docker.sock` (Docker rootless)
+- `~/.docker/desktop/docker.sock` (Docker Desktop for Linux)
+- `~/.colima/default/docker.sock` (Colima on macOS)
+- `$XDG_RUNTIME_DIR/podman/podman.sock` (Podman rootless)
+
+**Custom socket path:**
 
 ```json
 {
@@ -251,10 +280,7 @@ Example configuration for Podman:
 }
 ```
 
-The tool will automatically detect and use Podman if:
-
-- Docker socket is not available
-- Podman socket is found at standard locations (`/run/podman/podman.sock` or `$XDG_RUNTIME_DIR/podman/podman.sock`)
+Or set the `DOCKER_HOST` environment variable to override detection.
 
 ### Web UI Terminal
 
@@ -284,7 +310,11 @@ Claude Code Sandbox automatically discovers and forwards:
 **Claude Credentials:**
 
 - Anthropic API keys (`ANTHROPIC_API_KEY`)
-- macOS Keychain credentials (Claude Code)
+- OAuth credentials from:
+  - `~/.claude/.credentials.json` (Linux)
+  - `~/.claude/auth.json`
+  - `~/.config/claude/auth.json`
+  - `~/Library/Application Support/Claude/auth.json` (macOS)
 - AWS Bedrock credentials
 - Google Vertex credentials
 - Claude configuration files (`.claude.json`, `.claude/`)

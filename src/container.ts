@@ -34,6 +34,9 @@ export class ContainerManager {
       // Copy Claude configuration if it exists
       await this._copyClaudeConfig(container);
 
+      // Configure bypass permissions mode to skip confirmation prompt
+      await this._setupBypassPermissions(container);
+
       // Copy git configuration if it exists
       await this._copyGitConfig(container);
     } catch (error) {
@@ -256,6 +259,10 @@ exec claude --dangerously-skip-permissions' > /start-claude.sh && \\
         Binds: volumes,
         AutoRemove: false,
         NetworkMode: "bridge",
+        RestartPolicy: {
+          Name: this.config.restartPolicy || "unless-stopped",
+          MaximumRetryCount: this.config.restartPolicy === "on-failure" ? 5 : 0,
+        },
       },
       WorkingDir: "/workspace",
       Cmd: ["/bin/bash", "-l"],
@@ -790,7 +797,20 @@ exec claude --dangerously-skip-permissions' > /start-claude.sh && \\
         const tarFlags = getTarFlags();
         // On macOS, also exclude extended attributes that cause Docker issues
         const additionalFlags = (process.platform as string) === "darwin" ? "--no-xattrs --no-fflags" : "";
-        const combinedFlags = `${tarFlags} ${additionalFlags}`.trim();
+        // Exclude directories that are large, temporary, or actively written to
+        const excludeFlags = [
+          "--exclude=.claude/debug",
+          "--exclude=.claude/cache",
+          "--exclude=.claude/file-history",
+          "--exclude=.claude/session-env",
+          "--exclude=.claude/tasks",
+          "--exclude=.claude/paste-cache",
+          "--exclude=.claude/shell-snapshots",
+          "--exclude=.claude/telemetry",
+          "--exclude=.claude/todos",
+          "--exclude=.claude/statsig",
+        ].join(" ");
+        const combinedFlags = `${tarFlags} ${additionalFlags} ${excludeFlags}`.trim();
         execSync(
           `tar -cf "${tarFile}" ${combinedFlags} -C "${os.homedir()}" .claude`,
           {
@@ -804,6 +824,29 @@ exec claude --dangerously-skip-permissions' > /start-claude.sh && \\
         });
 
         fs.unlinkSync(tarFile);
+
+        // Fix plugin paths: installed_plugins.json contains absolute paths
+        // from the host (e.g. /home/linux/.claude/plugins/...) which won't
+        // resolve inside the container where home is /home/claude
+        const hostHome = os.homedir();
+        await container
+          .exec({
+            Cmd: [
+              "/bin/bash",
+              "-c",
+              `
+              # Rewrite absolute home paths in plugin registry files
+              for f in /home/claude/.claude/plugins/installed_plugins.json /home/claude/.claude/plugins/known_marketplaces.json; do
+                if [ -f "$f" ]; then
+                  sed -i 's|${hostHome}/|/home/claude/|g' "$f"
+                fi
+              done
+              `,
+            ],
+            AttachStdout: false,
+            AttachStderr: false,
+          })
+          .then((exec) => exec.start({}));
 
         // Fix permissions recursively
         await container
@@ -826,6 +869,76 @@ exec claude --dangerously-skip-permissions' > /start-claude.sh && \\
         error,
       );
       // Don't throw - this is not critical for container operation
+    }
+  }
+
+  private async _setupBypassPermissions(
+    container: Docker.Container,
+  ): Promise<void> {
+    try {
+      console.log(chalk.blue("• Configuring bypass permissions mode..."));
+
+      // The settings need to have defaultMode at the root level per Claude Code docs
+      const setupExec = await container.exec({
+        Cmd: [
+          "/bin/bash",
+          "-c",
+          `
+          # Ensure .claude directory exists
+          mkdir -p /home/claude/.claude &&
+
+          # Update settings.local.json to set bypass permissions mode
+          # Using settings.local.json as it takes precedence for user preferences
+          SETTINGS_FILE="/home/claude/.claude/settings.local.json"
+
+          if [ -f "$SETTINGS_FILE" ]; then
+            # File exists - try to merge with jq, fallback to simple approach
+            if command -v jq &> /dev/null; then
+              jq '. + {"defaultMode": "bypassPermissions"}' "$SETTINGS_FILE" > /tmp/settings.tmp && mv /tmp/settings.tmp "$SETTINGS_FILE"
+            else
+              # No jq - use python if available
+              python3 -c "
+import json
+with open('$SETTINGS_FILE', 'r') as f:
+    data = json.load(f)
+data['defaultMode'] = 'bypassPermissions'
+with open('$SETTINGS_FILE', 'w') as f:
+    json.dump(data, f, indent=2)
+" 2>/dev/null || echo '{"defaultMode": "bypassPermissions"}' > "$SETTINGS_FILE"
+            fi
+          else
+            # Create new settings file
+            echo '{"defaultMode": "bypassPermissions"}' > "$SETTINGS_FILE"
+          fi &&
+
+          # Fix permissions
+          chown -R claude:claude /home/claude/.claude &&
+          chmod 700 /home/claude/.claude &&
+          chmod 600 "$SETTINGS_FILE"
+          `,
+        ],
+        AttachStdout: true,
+        AttachStderr: true,
+      });
+
+      const stream = await setupExec.start({});
+
+      // Wait for completion (must consume stream data for it to end)
+      await new Promise<void>((resolve, reject) => {
+        stream.on("data", () => {}); // Consume data to allow stream to end
+        stream.on("end", resolve);
+        stream.on("error", reject);
+      });
+
+      console.log(
+        chalk.green("✓ Bypass permissions mode configured (no confirmation prompt)"),
+      );
+    } catch (error) {
+      console.error(
+        chalk.yellow("⚠ Failed to configure bypass permissions:"),
+        error,
+      );
+      // Don't throw - Claude will still work, just with the confirmation prompt
     }
   }
 
@@ -1099,11 +1212,24 @@ EOF
     }
   }
 
-  async cleanup(): Promise<void> {
+  async cleanup(intentional: boolean = true): Promise<void> {
     for (const [, container] of this.containers) {
       try {
-        await container.stop();
-        await container.remove();
+        if (intentional) {
+          // On intentional exit: disable restart policy, stop, and remove
+          try {
+            await container.update({
+              RestartPolicy: { Name: "no", MaximumRetryCount: 0 },
+            });
+          } catch {
+            // Ignore update errors (container may already be stopped)
+          }
+          await container.stop();
+          await container.remove();
+        } else {
+          // On non-intentional exit: just stop, leave container for Docker to restart
+          await container.stop();
+        }
       } catch (error) {
         // Container might already be stopped
       }

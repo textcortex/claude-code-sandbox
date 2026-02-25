@@ -8,6 +8,8 @@ import { UIManager } from "./ui";
 import { WebUIServer } from "./web-server";
 import { SandboxConfig } from "./types";
 import { getDockerConfig, isPodman } from "./docker-config";
+import { SHADOW_BASE_PATH } from "./config";
+import { SessionStore } from "./session-store";
 import path from "path";
 
 export class ClaudeSandbox {
@@ -19,6 +21,8 @@ export class ClaudeSandbox {
   private containerManager: ContainerManager;
   private ui: UIManager;
   private webServer?: WebUIServer;
+  private containerId?: string;
+  private sessionStore: SessionStore;
 
   constructor(config: SandboxConfig) {
     this.config = config;
@@ -35,6 +39,7 @@ export class ClaudeSandbox {
     this.gitMonitor = new GitMonitor(this.git);
     this.containerManager = new ContainerManager(this.docker, config);
     this.ui = new UIManager();
+    this.sessionStore = new SessionStore();
   }
 
   async run(): Promise<void> {
@@ -144,9 +149,33 @@ export class ClaudeSandbox {
 
       // Start container
       const containerId = await this.containerManager.start(containerConfig);
+      this.containerId = containerId;
       console.log(
         chalk.green(`✓ Started container: ${containerId.substring(0, 12)}`),
       );
+
+      // Record session for recovery
+      const shadowBasePath = this.config.shadowBasePath || SHADOW_BASE_PATH;
+      const sessionId = containerId.substring(0, 12);
+      await this.sessionStore.addSession({
+        containerId,
+        containerName: `${this.config.containerPrefix || "claude-code-sandbox"}-${Date.now()}`,
+        sessionId,
+        repoPath: process.cwd(),
+        branchName,
+        originalBranch: currentBranch.current,
+        shadowRepoPath: path.join(shadowBasePath, sessionId),
+        startTime: new Date().toISOString(),
+        lastActivityTime: new Date().toISOString(),
+        status: "active",
+        config: {
+          dockerImage: this.config.dockerImage,
+          defaultShell: this.config.defaultShell,
+          autoCommit: this.config.autoCommit,
+          autoCommitIntervalMinutes: this.config.autoCommitIntervalMinutes,
+          restartPolicy: this.config.restartPolicy,
+        },
+      });
 
       // Start monitoring for commits
       this.gitMonitor.on("commit", async (commit) => {
@@ -156,25 +185,40 @@ export class ClaudeSandbox {
       await this.gitMonitor.start(branchName);
       console.log(chalk.blue("✓ Git monitoring started"));
 
-      // Always launch web UI
-      this.webServer = new WebUIServer(this.docker);
+      // Launch web UI or attach to terminal directly
+      if (this.config.useWebUI !== false) {
+        this.webServer = new WebUIServer(this.docker);
 
-      // Pass repo info to web server
-      this.webServer.setRepoInfo(process.cwd(), branchName);
+        // Pass repo info and persistence config to web server
+        this.webServer.setRepoInfo(process.cwd(), branchName);
+        this.webServer.setShadowBasePath(
+          this.config.shadowBasePath || SHADOW_BASE_PATH,
+        );
+        this.webServer.setAutoCommitConfig(
+          this.config.autoCommit !== false,
+          this.config.autoCommitIntervalMinutes || 5,
+        );
 
-      const webUrl = await this.webServer.start();
+        const webUrl = await this.webServer.start();
 
-      // Open browser to the web UI with container ID
-      const fullUrl = `${webUrl}?container=${containerId}`;
-      await this.webServer.openInBrowser(fullUrl);
+        // Open browser to the web UI with container ID
+        const fullUrl = `${webUrl}?container=${containerId}`;
+        await this.webServer.openInBrowser(fullUrl);
 
-      console.log(chalk.green(`\n✓ Web UI available at: ${fullUrl}`));
-      console.log(
-        chalk.yellow("Keep this terminal open to maintain the session"),
-      );
+        console.log(chalk.green(`\n✓ Web UI available at: ${fullUrl}`));
+        console.log(
+          chalk.yellow("Keep this terminal open to maintain the session"),
+        );
 
-      // Keep the process running
-      await new Promise(() => {}); // This will keep the process alive
+        // Keep the process running
+        await new Promise(() => {}); // This will keep the process alive
+      } else {
+        // Terminal mode - attach directly to container
+        console.log(chalk.green("\n✓ Attaching to container terminal..."));
+        console.log(chalk.yellow("Press Ctrl+P, Ctrl+Q to detach\n"));
+
+        await this.attachToContainer(containerId);
+      }
     } catch (error) {
       console.error(chalk.red("Error:"), error);
       throw error;
@@ -204,7 +248,7 @@ export class ClaudeSandbox {
       credentials,
       workDir,
       repoName,
-      dockerImage: this.config.dockerImage || "claude-sandbox:latest",
+      dockerImage: this.config.dockerImage || "claude-code-sandbox:latest",
       prFetchRef,
       remoteFetchRef,
     };
@@ -260,12 +304,96 @@ export class ClaudeSandbox {
     }
   }
 
-  private async cleanup(): Promise<void> {
+  private async cleanup(intentional: boolean = true): Promise<void> {
     await this.gitMonitor.stop();
-    await this.containerManager.cleanup();
+    await this.containerManager.cleanup(intentional);
     if (this.webServer) {
-      await this.webServer.stop();
+      await this.webServer.stop(intentional);
     }
+
+    // Update session store
+    if (this.containerId) {
+      if (intentional) {
+        await this.sessionStore.removeSession(this.containerId);
+      } else {
+        await this.sessionStore.updateSession(this.containerId, {
+          status: "stopped",
+          exitType: "crash",
+          lastActivityTime: new Date().toISOString(),
+        });
+      }
+    }
+  }
+
+  private async attachToContainer(containerId: string): Promise<void> {
+    const container = this.docker.getContainer(containerId);
+
+    // Get current terminal size
+    const getTerminalSize = () => ({
+      h: process.stdout.rows || 24,
+      w: process.stdout.columns || 80,
+    });
+
+    const termSize = getTerminalSize();
+
+    // Execute the startup script in an interactive session
+    const dockerExec = await container.exec({
+      Cmd: ["/bin/bash", "-l", "-c", "/home/claude/start-session.sh"],
+      AttachStdin: true,
+      AttachStdout: true,
+      AttachStderr: true,
+      Tty: true,
+    });
+
+    const stream = await dockerExec.start({
+      hijack: true,
+      stdin: true,
+      Tty: true,
+    });
+
+    // Set initial terminal size
+    await dockerExec.resize(termSize);
+
+    // Handle terminal resize events
+    const resizeHandler = async () => {
+      try {
+        await dockerExec.resize(getTerminalSize());
+      } catch {
+        // Ignore resize errors (exec might have ended)
+      }
+    };
+    process.stdout.on("resize", resizeHandler);
+
+    // Set up raw mode for proper terminal handling
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(true);
+    }
+    process.stdin.resume();
+
+    // Pipe streams
+    process.stdin.pipe(stream);
+    stream.pipe(process.stdout);
+
+    // Handle stream end
+    stream.on("end", async () => {
+      process.stdout.off("resize", resizeHandler);
+      if (process.stdin.isTTY) {
+        process.stdin.setRawMode(false);
+      }
+      process.stdin.pause();
+      await this.cleanup();
+      process.exit(0);
+    });
+
+    // Handle Ctrl+C gracefully
+    process.on("SIGINT", async () => {
+      process.stdout.off("resize", resizeHandler);
+      if (process.stdin.isTTY) {
+        process.stdin.setRawMode(false);
+      }
+      await this.cleanup();
+      process.exit(0);
+    });
   }
 }
 

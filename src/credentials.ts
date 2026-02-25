@@ -85,9 +85,13 @@ export class CredentialManager {
   }
 
   private async findOAuthToken(): Promise<string | null> {
-    // Check common locations for Claude OAuth tokens
+    // Check common locations for Claude OAuth tokens/credentials
     const possiblePaths = [
+      // Linux/cross-platform credential locations
+      path.join(os.homedir(), ".claude", ".credentials.json"),
       path.join(os.homedir(), ".claude", "auth.json"),
+      path.join(os.homedir(), ".config", "claude", "auth.json"),
+      // macOS credential locations
       path.join(
         os.homedir(),
         "Library",
@@ -95,15 +99,17 @@ export class CredentialManager {
         "Claude",
         "auth.json",
       ),
-      path.join(os.homedir(), ".config", "claude", "auth.json"),
     ];
 
     for (const authPath of possiblePaths) {
       try {
         const content = await fs.readFile(authPath, "utf-8");
         const auth = JSON.parse(content);
-        if (auth.access_token) {
-          return auth.access_token;
+        // Check various token field names used by Claude Code
+        if (auth.claudeAiOauth || auth.accessToken || auth.access_token) {
+          // Return indicator that OAuth credentials exist
+          // The actual credentials will be copied via _copyClaudeConfig
+          return "oauth-credentials-found";
         }
       } catch {
         // Continue checking other paths

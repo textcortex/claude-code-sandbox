@@ -7,6 +7,10 @@ import { ClaudeSandbox } from "./index";
 import { loadConfig } from "./config";
 import { WebUIServer } from "./web-server";
 import { getDockerConfig, isPodman } from "./docker-config";
+import { SessionStore } from "./session-store";
+import { SHADOW_BASE_PATH } from "./config";
+import { recoverSession } from "./recover";
+import * as fsExtra from "fs-extra";
 import ora from "ora";
 
 // Initialize Docker with config - will be updated after loading config if needed
@@ -125,6 +129,7 @@ program
     "Start with 'claude' or 'bash' shell",
     /^(claude|bash)$/i,
   )
+  .option("--no-web", "Disable web UI (use terminal attach)")
   .action(async (options) => {
     console.log(chalk.blue("🚀 Starting new Claude Sandbox container..."));
 
@@ -136,6 +141,7 @@ program
     config.targetBranch = options.branch;
     config.remoteBranch = options.remoteBranch;
     config.prNumber = options.pr;
+    config.useWebUI = options.web !== false;
     if (options.shell) {
       config.defaultShell = options.shell.toLowerCase();
     }
@@ -337,8 +343,9 @@ program
 // Clean command - remove stopped containers
 program
   .command("clean")
-  .description("Remove all stopped Claude Sandbox containers")
+  .description("Remove all stopped Claude Sandbox containers and orphaned data")
   .option("-f, --force", "Remove all containers (including running)")
+  .option("--shadows", "Also clean orphaned shadow repos")
   .action(async (options) => {
     await ensureDockerConfig();
     const spinner = ora("Cleaning up containers...").start();
@@ -349,21 +356,65 @@ program
         ? containers
         : containers.filter((c) => c.State !== "running");
 
-      if (targetContainers.length === 0) {
-        spinner.info("No containers to clean up.");
-        return;
-      }
-
-      for (const c of targetContainers) {
-        const container = docker.getContainer(c.Id);
-        if (c.State === "running" && options.force) {
-          await container.stop();
+      let removed = 0;
+      if (targetContainers.length > 0) {
+        for (const c of targetContainers) {
+          const container = docker.getContainer(c.Id);
+          if (c.State === "running" && options.force) {
+            await container.stop();
+          }
+          await container.remove();
+          spinner.text = `Removed ${c.Id.substring(0, 12)}`;
+          removed++;
         }
-        await container.remove();
-        spinner.text = `Removed ${c.Id.substring(0, 12)}`;
       }
 
-      spinner.succeed(`Cleaned up ${targetContainers.length} container(s)`);
+      // Clean session records for containers that no longer exist
+      spinner.text = "Cleaning session records...";
+      const store = new SessionStore();
+      const sessions = await store.load();
+      let sessionsRemoved = 0;
+      for (const session of sessions) {
+        try {
+          const container = docker.getContainer(session.containerId);
+          await container.inspect();
+          // Container exists — keep the record
+        } catch {
+          // Container gone — remove the record
+          await store.removeSession(session.containerId);
+          sessionsRemoved++;
+        }
+      }
+
+      // Clean orphaned shadow repos if requested
+      let shadowsRemoved = 0;
+      if (options.shadows && (await fsExtra.pathExists(SHADOW_BASE_PATH))) {
+        spinner.text = "Cleaning orphaned shadow repos...";
+        const entries = await fsExtra.readdir(SHADOW_BASE_PATH);
+        const activeSessions = await store.load();
+        const activeSessionIds = new Set(
+          activeSessions.map((s) => s.sessionId),
+        );
+
+        for (const entry of entries) {
+          if (!activeSessionIds.has(entry)) {
+            const shadowPath = `${SHADOW_BASE_PATH}/${entry}`;
+            await fsExtra.remove(shadowPath);
+            shadowsRemoved++;
+          }
+        }
+      }
+
+      const parts = [];
+      if (removed > 0) parts.push(`${removed} container(s)`);
+      if (sessionsRemoved > 0) parts.push(`${sessionsRemoved} session record(s)`);
+      if (shadowsRemoved > 0) parts.push(`${shadowsRemoved} shadow repo(s)`);
+
+      if (parts.length > 0) {
+        spinner.succeed(`Cleaned up ${parts.join(", ")}`);
+      } else {
+        spinner.info("Nothing to clean up.");
+      }
     } catch (error: any) {
       spinner.fail(chalk.red(`Failed: ${error.message}`));
       process.exit(1);
@@ -434,12 +485,27 @@ program
         }
       }
 
+      // Clear all session records
+      spinner.text = "Clearing session records...";
+      const store = new SessionStore();
+      await store.clearAll();
+
+      // Clear all shadow repos
+      spinner.text = "Clearing shadow repos...";
+      if (await fsExtra.pathExists(SHADOW_BASE_PATH)) {
+        await fsExtra.remove(SHADOW_BASE_PATH);
+      }
+
       if (removed === containers.length) {
-        spinner.succeed(chalk.green(`✓ Purged all ${removed} container(s)`));
+        spinner.succeed(
+          chalk.green(
+            `✓ Purged all ${removed} container(s), session records, and shadow repos`,
+          ),
+        );
       } else {
         spinner.warn(
           chalk.yellow(
-            `Purged ${removed} of ${containers.length} container(s)`,
+            `Purged ${removed} of ${containers.length} container(s), plus session records and shadow repos`,
           ),
         );
       }
@@ -468,5 +534,86 @@ program
       process.exit(1);
     }
   });
+
+// Recover command - recover sessions after crash/reboot
+program
+  .command("recover")
+  .description("Recover Claude Sandbox sessions after a crash or reboot")
+  .option("-l, --list", "List recoverable sessions without recovering")
+  .action(async (options) => {
+    await ensureDockerConfig();
+    const spinner = ora("Scanning for recoverable sessions...").start();
+
+    try {
+      const store = new SessionStore();
+      const sessions = await store.getRecoverableSessions(docker);
+
+      spinner.stop();
+
+      if (sessions.length === 0) {
+        console.log(chalk.yellow("No recoverable sessions found."));
+        return;
+      }
+
+      console.log(
+        chalk.blue(`Found ${sessions.length} recoverable session(s):\n`),
+      );
+
+      for (const session of sessions) {
+        const age = getAge(session.startTime);
+        const stateColor =
+          session.containerState === "running"
+            ? chalk.green
+            : session.containerState === "stopped"
+              ? chalk.yellow
+              : chalk.red;
+
+        console.log(
+          `  ${chalk.cyan(session.sessionId)} | ` +
+            `${chalk.white(session.branchName)} | ` +
+            `${stateColor(session.containerState)} | ` +
+            `shadow: ${session.shadowExists ? chalk.green("yes") : chalk.red("no")} | ` +
+            `${chalk.gray(age)} | ` +
+            `${chalk.gray(session.repoPath)}`,
+        );
+      }
+      console.log();
+
+      if (options.list) {
+        return;
+      }
+
+      // Interactive selection
+      const choices = sessions.map((s) => ({
+        name: `${s.sessionId} - ${s.branchName} (${s.containerState}, shadow: ${s.shadowExists ? "yes" : "no"}) - ${getAge(s.startTime)}`,
+        value: s.containerId,
+      }));
+
+      const { selectedId } = await inquirer.prompt([
+        {
+          type: "list",
+          name: "selectedId",
+          message: "Select a session to recover:",
+          choices,
+        },
+      ]);
+
+      const session = sessions.find((s) => s.containerId === selectedId)!;
+      await recoverSession(docker, session, store);
+    } catch (error: any) {
+      spinner.fail(chalk.red(`Failed: ${error.message}`));
+      process.exit(1);
+    }
+  });
+
+function getAge(isoTimestamp: string): string {
+  const diff = Date.now() - new Date(isoTimestamp).getTime();
+  const minutes = Math.floor(diff / 60000);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
 
 program.parse();
